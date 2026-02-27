@@ -20482,6 +20482,76 @@
         },
         {
           "path": "lecture_01.py",
+          "line_number": 726,
+          "function_name": "train_bpe",
+          "code": "vocab: dict[int, bytes] = {x: bytes([x]) for x in range(256)}  # index -> bytes"
+        },
+        {
+          "path": "lecture_01.py",
+          "line_number": 726,
+          "function_name": "<dictcomp>",
+          "code": "vocab: dict[int, bytes] = {x: bytes([x]) for x in range(256)}  # index -> bytes"
+        }
+      ],
+      "env": {},
+      "renderings": [],
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "stack": [
+        {
+          "path": "lecture_01.py",
+          "line_number": 33,
+          "function_name": "main",
+          "code": "tokenization()"
+        },
+        {
+          "path": "lecture_01.py",
+          "line_number": 495,
+          "function_name": "tokenization",
+          "code": "bpe_tokenizer()"
+        },
+        {
+          "path": "lecture_01.py",
+          "line_number": 705,
+          "function_name": "bpe_tokenizer",
+          "code": "params = train_bpe(string, num_merges=3)"
+        },
+        {
+          "path": "lecture_01.py",
+          "line_number": 726,
+          "function_name": "train_bpe",
+          "code": "vocab: dict[int, bytes] = {x: bytes([x]) for x in range(256)}  # index -> bytes"
+        }
+      ],
+      "env": {},
+      "renderings": [],
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "stack": [
+        {
+          "path": "lecture_01.py",
+          "line_number": 33,
+          "function_name": "main",
+          "code": "tokenization()"
+        },
+        {
+          "path": "lecture_01.py",
+          "line_number": 495,
+          "function_name": "tokenization",
+          "code": "bpe_tokenizer()"
+        },
+        {
+          "path": "lecture_01.py",
+          "line_number": 705,
+          "function_name": "bpe_tokenizer",
+          "code": "params = train_bpe(string, num_merges=3)"
+        },
+        {
+          "path": "lecture_01.py",
           "line_number": 728,
           "function_name": "train_bpe",
           "code": "for i in range(num_merges):"
