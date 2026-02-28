@@ -8,7 +8,7 @@ import torch.distributed.fsdp
 from execute_util import text, image, link, system_text
 from torch_util import get_device
 from lecture_util import article_link
-from lecture_08_utils import spawn, int_divide, summarize_tensor, get_init_params, render_duration
+from lecture_08_utils import spawn_wrapper, int_divide, summarize_tensor, get_init_params, render_duration
 
 def main():
     text("Last week: parallelism within a single GPU")
@@ -120,7 +120,7 @@ def torch_distributed():
     text("- Also supports higher-level algorithms (e.g., `FullyShardedDataParallel`) [not used in this course]")
 
     text("Let's walk through some examples.")
-    spawn(collective_operations_main, world_size=4)
+    spawn_wrapper(collective_operations_main, world_size=4)
 
 
 def collective_operations_main(rank: int, world_size: int):
@@ -165,10 +165,10 @@ def benchmarking():
     text("Let's see how fast communication happens (restrict to one node).")
 
     # All-reduce
-    spawn(all_reduce, world_size=4, num_elements=100 * 1024**2)
+    spawn_wrapper(all_reduce, world_size=4, num_elements=100 * 1024**2)
 
     # Reduce-scatter
-    spawn(reduce_scatter, world_size=4, num_elements=100 * 1024**2)
+    spawn_wrapper(reduce_scatter, world_size=4, num_elements=100 * 1024**2)
 
     # References
     link(title="How to reason about operations", url="https://github.com/NVIDIA/nccl-tests/blob/master/doc/PERFORMANCE.md#allreduce")
@@ -249,7 +249,7 @@ def data_parallelism():
     text("Sharding strategy: each rank gets a slice of the data")
 
     data = generate_sample_data()
-    spawn(data_parallelism_main, world_size=4, data=data, num_layers=4, num_steps=1)
+    spawn_wrapper(data_parallelism_main, world_size=4, data=data, num_layers=4, num_steps=1)
 
     text("Notes:")
     text("- Losses are different across ranks (computed on local data)")
@@ -307,7 +307,7 @@ def tensor_parallelism():
     text("Sharding strategy: each rank gets part of each layer, transfer all data/activations")
 
     data = generate_sample_data()
-    spawn(tensor_parallelism_main, world_size=4, data=data, num_layers=4)
+    spawn_wrapper(tensor_parallelism_main, world_size=4, data=data, num_layers=4)
 
 
 def tensor_parallelism_main(rank: int, world_size: int, data: torch.Tensor, num_layers: int):
@@ -349,7 +349,7 @@ def pipeline_parallelism():
     text("Sharding strategy: each rank gets subset of layers, transfer all data/activations")
 
     data = generate_sample_data()
-    spawn(pipeline_parallelism_main, world_size=2, data=data, num_layers=4, num_micro_batches=4)
+    spawn_wrapper(pipeline_parallelism_main, world_size=2, data=data, num_layers=4, num_micro_batches=4)
 
 
 def pipeline_parallelism_main(rank: int, world_size: int, data: torch.Tensor, num_layers: int, num_micro_batches: int):

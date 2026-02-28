@@ -45,7 +45,7 @@ class DisableDistributed:
             setattr(dist, name, self.old_functions[name])
 
 
-def spawn(func: Callable, world_size: int, *args, **kwargs):
+def spawn_wrapper(func: Callable, world_size: int, *args, **kwargs):
     # Note: assume kwargs are in the same order as what main needs
     """
     当检测到调试器（如pdb）时自动触发
@@ -62,7 +62,34 @@ def spawn(func: Callable, world_size: int, *args, **kwargs):
             args = (0, world_size,) + args + tuple(kwargs.values())
             func(*args)
     else:
+        # 将kwargs转换为元组
         args = (world_size,) + args + tuple(kwargs.values())
+        print(f"spawn wrapper args:{args}")
+        """
+        NOTE：这里的spawn函数是torch.multiprocessing.spawn函数，不是python multiprocessing的spawn函数, rank 参数是自动传递的
+
+        当 mp.spawn 启动时，它会：
+        为每个进程自动生成一个 rank（从 0 到 world_size-1）
+        将 rank 作为第一个参数传递给目标函数
+        将 args 中的参数作为后续参数传递
+
+        # 您的调用
+        spawn_wrapper(reduce_scatter, world_size=4, num_elements_per_rank=100)
+
+        # 内部展开成：
+        mp.spawn(
+            reduce_scatter, 
+            args=(4, 100),  # world_size 和 num_elements_per_rank
+            nprocs=4, 
+            join=True
+        )
+
+        # spawn 实际调用每个进程时：
+        # 进程0: reduce_scatter(rank=0, world_size=4, num_elements_per_rank=100)
+        # 进程1: reduce_scatter(rank=1, world_size=4, num_elements_per_rank=100)
+        # 进程2: reduce_scatter(rank=2, world_size=4, num_elements_per_rank=100)
+        # 进程3: reduce_scatter(rank=3, world_size=4, num_elements_per_rank=100)
+        """
         mp.spawn(func, args=args, nprocs=world_size, join=True)
 
 
@@ -77,6 +104,30 @@ def summarize_tensor(tensor: torch.Tensor) -> str:
 
 def get_init_params(num_inputs: int, num_outputs: int, rank: int) -> nn.Parameter:
     torch.random.manual_seed(0)  # For reproducibility
+    """
+    参数：
+        num_inputs (int): 输入维度
+        num_outputs (int): 输出维度
+        rank (int): 进程的rank号，用于确定随机数生成器的种子
+    初始化参数，使用正态分布随机数，并进行归一化处理。
+
+
+    # 缩放后的方差
+    Var(scaled) = 1 / num_outputs
+    除以sqrt(num_outputs)这是为了保持前向传播和反向传播时激活值和梯度的方差稳定。
+
+    # Xavier 均匀分布
+    limit = math.sqrt(6 / (num_inputs + num_outputs))
+    nn.init.xavier_uniform_(tensor)
+
+    # Xavier 正态分布
+    std = math.sqrt(2 / (num_inputs + num_outputs))
+    nn.init.xavier_normal_(tensor) 
+
+    # Kaiming 正态分布
+    std = math.sqrt(2 / num_inputs)
+    nn.init.kaiming_normal_(tensor, mode='fan_in')
+    """
     return nn.Parameter(torch.randn(num_inputs, num_outputs, device=get_device(rank)) / math.sqrt(num_outputs))
 
 
