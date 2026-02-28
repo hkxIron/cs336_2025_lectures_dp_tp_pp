@@ -1,6 +1,7 @@
 import torch
 import time
 import os
+import sys
 from typing import List, Callable
 import torch.nn.functional as F
 import torch.distributed as dist
@@ -46,9 +47,20 @@ def collective_operations_main(rank: int, world_size: int):
     Rank 3 [after all-reduce]: tensor([ 6., 10., 14., 18.]) 
     """
 
-    # NOTE: Reduce-scatter
-    dist.barrier()
+    # NOTE: All-reduce 2D
+    dist.barrier()  # Waits for all processes to get to this point (in this case, for print statements)
 
+    tensor = torch.tensor([[0., 1],
+                                        [ 2, 3]], device=get_device(rank)) + rank  # Both input and output
+    print(f"Rank {rank} [before all-reduce-2D]: {tensor}", flush=True) # tensor([ 0.,  1.,  2.,  3.])
+    dist.all_reduce(tensor=tensor, op=dist.ReduceOp.SUM, async_op=False)  # Modifies tensor in place
+    print(f"Rank {rank} [after all-reduce-2D]: {tensor}", flush=True) # tensor([ 6., 10., 14., 18.])
+    """
+    """
+    sys.exit(0)
+
+    dist.barrier()
+    # NOTE: Reduce-scatter
     input = torch.arange(world_size, dtype=torch.float32, device=get_device(rank)) + rank  # Input
     output = torch.empty(1, device=get_device(rank))  # Allocate output, 此时output中的值为随机值
 
