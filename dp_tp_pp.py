@@ -26,7 +26,7 @@ def main():
     # benchmarking()             # Measure actual NCCL bandwidth
 
     # data_parallelism()         # Cut up along the batch dimension
-    # tensor_parallelism()       # Cut up along the width dimension
+    #tensor_parallelism()       # Cut up along the width dimension
     pipeline_parallelism()     # Cut up along the depth dimension
 
 def torch_distributed():
@@ -410,6 +410,7 @@ def data_parallelism():
 
 
 def generate_sample_data():
+    torch.seed(42)
     batch_size = 128
     num_dim = 1024
     data = torch.randn(batch_size, num_dim)
@@ -450,7 +451,7 @@ def data_parallelism_main(rank: int, world_size: int, data: torch.Tensor, num_la
         # Sync gradients across workers (only difference between standard training and DDP)
         # 将各layer的参数梯度进行平均
         for param in params:
-            dist.all_reduce(tensor=param.grad, op=dist.ReduceOp.AVG, async_op=False)
+            dist.all_reduce(tensor=param.grad, op=dist.ReduceOp.AVG, async_op=False) # all_reduce_avg
 
         # Update parameters
         optimizer.step()
@@ -474,7 +475,9 @@ def tensor_parallelism():
     data = generate_sample_data()
     #spawn_wrapper(tensor_parallelism_main, world_size=4, data=data, num_layers=4)
     spawn_wrapper(tensor_parallelism_main_auto_grad, world_size=4, data=data, num_layers=4)
-    spawn_wrapper(tensor_parallelism_main_no_autograd, world_size=4, data=data, num_layers=4)
+    # 可以看到，启用或者不启用adamw optimizer，收敛速度完全不一样，adamw会快很多
+    spawn_wrapper(tensor_parallelism_main_manual_grad, world_size=4, data=data, num_layers=4, use_optimizer=True)
+    spawn_wrapper(tensor_parallelism_main_manual_grad, world_size=4, data=data, num_layers=4, use_optimizer=False)
     #sys.exit()
 
 def tensor_parallelism_main(rank: int, world_size: int, data: torch.Tensor, num_layers: int):
@@ -514,7 +517,9 @@ def tensor_parallelism_main(rank: int, world_size: int, data: torch.Tensor, num_
         # CODE HERE
     cleanup()
 
-def tensor_parallelism_main_no_autograd(rank: int, world_size: int, data: torch.Tensor, num_layers: int):
+def tensor_parallelism_main_manual_grad(rank: int, world_size: int, data: torch.Tensor, 
+                                        num_layers: int,
+                                        use_optimizer: bool = False):
     setup(rank, world_size)
 
     data = data.to(get_device(rank))
@@ -522,14 +527,20 @@ def tensor_parallelism_main_no_autograd(rank: int, world_size: int, data: torch.
     num_dim = data.size(1)
     local_num_dim = int_divide(num_dim, world_size)
 
-    # 初始化参数
-    params: List[Parameter] = [get_init_params(num_dim, local_num_dim, rank) for i in range(num_layers)]
+    # 初始化参数, 每层完整的param的shape是[global_dim, global_dim]
+    param_per_layer_list: List[Parameter] = [get_init_params(num_dim, local_num_dim, rank) for i in range(num_layers)]
+    # 需要定义优化器
+    if use_optimizer:
+        print(f"[tensor_parallelism] Rank {rank}: use optimizer")
+        optimizer = torch.optim.AdamW(param_per_layer_list, lr=1e-3)
 
     # 简单的SGD更新，或者仅用于打印梯度验证
     lr = 1e-3
 
     num_steps = 10
     for step in range(num_steps):
+        if use_optimizer:
+            optimizer.zero_grad()
         # ==========================================
         # Forward pass (需修改以缓存中间变量)
         # ==========================================
@@ -538,31 +549,36 @@ def tensor_parallelism_main_no_autograd(rank: int, world_size: int, data: torch.
         # 缓存列表，用于反向传播
         # inputs_cache: 存储每一层的输入 X [Batch, Global_Dim]
         # pre_act_cache: 存储每一层激活前的结果 Z [Batch, Local_Dim]
-        inputs_cache_per_layer:List[torch.Tensor] = []
-        prev_activation_cache_per_layer:List[torch.Tensor] = []
+        inputs_cache_per_layer_list:List[torch.Tensor] = [] # 每层的输入的缓存
+        prev_activation_cache_per_layer:List[torch.Tensor] = [] # 激活前的结果缓存
 
         for i in range(num_layers):
             # 1. 缓存当前层的输入
-            inputs_cache_per_layer.append(x)
+            # x: [batch, Global]
+            inputs_cache_per_layer_list.append(x)
 
             # 2. 局部计算
-            # x: [B, Global], param: [Global, Local] -> z: [B, Local]
-            z = x @ params[i]
+            # x: [batch, Global], param: [Global, Local] -> z: [batch, Local]
+            z = x @ param_per_layer_list[i]
 
             # 3. 缓存激活前的值 (用于计算GELU的导数)
             prev_activation_cache_per_layer.append(z)
 
-            # 4. 激活函数
+            # 4. 激活函数, shape: [batcch_size, local_num_dim]
             local_act = F.gelu(z)
 
             # 5. 通信 (All-Gather)
-            activations = [torch.empty(batch_size, local_num_dim, device=get_device(rank)) for _ in range(world_size)]
+            # 创建buffer list, 每个buffer的shape是[batch_size, local_num_dim]
+            activations: List[torch.Tensor] = [torch.empty(batch_size, local_num_dim, device=get_device(rank)) for _ in range(world_size)]
             dist.all_gather(tensor_list=activations, tensor=local_act, async_op=False)
 
             # 6. 拼接
+            # shape: [batcch_size, local_num_dim] 
+            # => shape: [batch_size, global_num_dim]
             x = torch.cat(activations, dim=1)
             # if rank<=1:
             #     print(f"[tensor_parallelism] Rank {rank} step:{step}: forward pass produced activations {summarize_tensor(x)}", flush=True)
+        # END OF FORWARD PASS
 
         # ==========================================
         # Backward pass (Manual Implementation)
@@ -572,8 +588,12 @@ def tensor_parallelism_main_no_autograd(rank: int, world_size: int, data: torch.
         # Loss = mean(x^2) -> dL/dx = 2*x / numel
         # grad_x: [Batch, Global_Dim]
         grad_x = 2 * x / x.numel()
+        
+        # loss = x.square().mean()
+        # loss.backward()
+        # grad_x = x.grad
 
-        # 从最后一层向前遍历
+        # 从最后一层手动向前遍历
         for i in reversed(range(num_layers)):
             # --- Step A: 处理 All-Gather 的反向 (Split/Slice) ---
             # 前向是 Concat(AllGather(local))，反向就是切片取出属于当前rank的那部分梯度
@@ -586,59 +606,67 @@ def tensor_parallelism_main_no_autograd(rank: int, world_size: int, data: torch.
 
             # --- Step B: 处理 Activation (GELU) 的反向 ---
             # d(GELU(z))/dz * grad_output
-            # 为了简化数学公式书写，这里我们利用PyTorch的自动求导计算局部元素的导数
-            # (这在手动实现中是允许的，只要不依赖整个图)
             z = prev_activation_cache_per_layer[i]
-            with torch.enable_grad():
+            with torch.enable_grad(): # 与no_grad相反
+                # 为了简化数学公式书写，这里我们利用PyTorch的自动求导计算局部元素的gelu导数
+                # (这在手动实现中是允许的，只要不依赖整个图)
                 z_temp = z.detach().requires_grad_(True)
                 out_temp = F.gelu(z_temp)
                 out_temp.backward(grad_local_act)
-                grad_z = z_temp.grad # shape: [Batch, Local_Dim]
+                grad_z = z_temp.grad # shape: [Batch, Local_Dim], 计算grad_z的梯度
 
             # --- Step C: 处理 MatMul (Z = X @ W) 的反向 ---
             # 我们需要计算 dL/dW 和 dL/dX
-            input_x = inputs_cache_per_layer[i] # shape: [Batch, Global_Dim]
-            weight = params[i]        # shape: [Global_Dim, Local_Dim]
+            # 原本每层完整的param的shape是[global, global]
+            input_x = inputs_cache_per_layer_list[i] # shape: [Batch, Global_Dim]
+            weight = param_per_layer_list[i]        # shape: [Global_Dim, Local_Dim]
 
             # z = x @ W
             # 1. 计算权重梯度: dL/dW = X^T @ dL/dZ
             # [Global, Batch] @ [Batch, Local] -> [Global, Local]
             grad_w = input_x.t() @ grad_z
 
-            # 手动保存梯度到 param.grad
+            # 手动保存梯度到param.grad
+            # weight.grad: [Global, Local]
             weight.grad = grad_w # 这里直接覆盖，因为没有累积steps
 
             # 2. 计算输入梯度: dL/dX_partial = dL/dZ @ W^T
             # [Batch, Local] @ [Local, Global] -> grad_x_partial: [Batch, Global]
             # 注意：这只是当前 rank 对输入 X 的梯度贡献
+            # z = x @ W, dL/dX_partial = dL/dZ @ W^T
             grad_x_partial = grad_z @ weight.t()
 
             # --- Step D: 处理输入复制的反向 (All-Reduce) ---
             # 前向传播时，输入 X 被复制到了所有 rank。
             # 反向传播时，我们需要将所有 rank 对 X 的梯度贡献相加。
+            # grad_x_partial: [Batch, Global], 注意：这里是SUM而不是MEAN
             dist.all_reduce(grad_x_partial, op=dist.ReduceOp.SUM, async_op=False)
 
             # 更新 grad_x 用于上一层的计算
             # grad_x: [Batch, Global_Dim]
             grad_x = grad_x_partial
+        # END OF BACKWARD PASS
 
         # ==========================================
         # Optimizer Step (Manual)
         # ==========================================
         loss_val = x.square().mean().item()
-        grad_norm = params[0].grad.norm().item() if params[0].grad is not None else 0
-        print(f"[tensor_parallel_no_autograd][Rank {rank}] Step {step}: Loss = {loss_val:.6f}, Grad Norm (Layer 0) = {grad_norm:.4f}", flush=True)
+        grad_norm = param_per_layer_list[0].grad.norm().item() if param_per_layer_list[0].grad is not None else 0
+        print(f"[tensor_parallel_manual_grad][Rank {rank}] Step {step}: Loss = {loss_val:.6f}, Grad Norm (Layer 0) = {grad_norm:.4f}", flush=True)
 
-        # 简单的 SGD 更新
-        with torch.no_grad():
-            for param in params:
-                param -= lr/math.sqrt(step+1) * param.grad
-                # 清零梯度 (可选，因为上面是直接覆盖)
-                param.grad = None
+        if use_optimizer:
+            optimizer.step()
+        else:
+            # 简单的 SGD 更新
+            with torch.no_grad():
+                for param in param_per_layer_list:
+                    param -= lr/math.sqrt(step+1) * param.grad
+                    # 清零梯度 (可选，因为上面是直接覆盖)
+                    param.grad = None
 
     cleanup()
 
-class TP_AllGather(torch.autograd.Function):
+class TP_AllGather_Op(torch.autograd.Function):
     """
     前向传播：All-Gather (将切分的输出拼接成完整的)
     反向传播：Split (将完整的梯度切分回各个rank)
@@ -647,8 +675,9 @@ class TP_AllGather(torch.autograd.Function):
     它们各自计算出的梯度也是针对各自部分的，因此不需要像数据并行那样对 param.grad 进行 All-Reduce。直接 optimizer.step() 即可。
     """
     @staticmethod
-    def forward(ctx, input, world_size:int) -> torch.Tensor:
+    def forward(ctx, input:torch.Tensor, world_size:int) -> torch.Tensor:
         # input: [batch_size, local_dim]
+        # gather => 
         # output: [batch_size, global_dim]
 
         # 1. 准备输出张量列表
@@ -656,16 +685,17 @@ class TP_AllGather(torch.autograd.Function):
         local_dim = input.size(1)
         global_dim = local_dim * world_size
 
-        # 创建输出列表, world_size个元素，每个元素都是一个空的张量[batch_size, local_dim]
+        # 创建输出列表buffer, 有world_size个元素，每个元素都是一个空的张量[batch_size, local_dim]
         tensor_list: List[torch.Tensor] = [torch.empty_like(input) for _ in range(world_size)]
 
-        # 2. 执行 All-Gather
+        # 2. 执行 All-Gather, 收集到tensor_list中
         dist.all_gather(tensor_list, input, async_op=False)
 
         # 3. 拼接
-        # output: [batch_size, global_dim]
+        # output: [batch_size, global_dim=local_dim * world_size]
         output = torch.cat(tensor_list, dim=1)
 
+        # 部分数据放在context中，以便在反向传播时使用
         ctx.world_size = world_size
         ctx.local_dim = local_dim
         return output
@@ -673,7 +703,8 @@ class TP_AllGather(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output:torch.Tensor):
         # grad_output: [batch_size, global_dim]
-        # return: [batch_size, local_dim]
+        # =>
+        # grad_input: [batch_size, local_dim]
 
         # 反向传播时，只需要取出属于当前rank的那一部分梯度
         rank = dist.get_rank()
@@ -682,19 +713,28 @@ class TP_AllGather(torch.autograd.Function):
 
         # Slice操作 (Split)
         # grad_output: [batch_size, global_dim], 在hidden_dim维度上对grad进行切分
+        # grad_input: [batch_size, local_dim]
         grad_input = grad_output[:, start:end]
-
+        
+        # forward时有几个input, backward时就有几个output
         return grad_input, None # 这里的None是对world_size的梯度求导，因为world_size是常数，所以返回None
 
+@DeprecationWarning
 class TP_CopyTo(torch.autograd.Function):
     """
     前向传播：Identity (不做任何事，输入即输出)
     反向传播：All-Reduce (将各个rank计算出的关于输入的偏导数求和)
 
+    X: [batch_size, global_dim]
+    W_i: [global_dim, local_dim]
+    Y: [batch_size, local_dim]
+    Y = X @ W_i
+
     原因：每一层的输入X在所有rank上是相同的（复制的）。
     但在反向传播时，每个rank只计算了X对局部权重W_i的梯度贡献。
     为了得到X的总梯度，必须将所有rank的贡献相加。
     即梯度 G_i = dL/dY_i * W_i
+
     X 的真实总梯度应该是所有贡献之和：
     G = sum_i(G_i) = sum_i(dL/dY_i * W_i)
 
@@ -721,29 +761,37 @@ def tensor_parallelism_main_auto_grad(rank: int, world_size: int, data: torch.Te
     local_num_dim = int_divide(num_dim, world_size)
 
     # Create model
-    params = [get_init_params(num_dim, local_num_dim, rank) for i in range(num_layers)]
+    # 每个rank上的参数是切分的, shape: [global_dim, local_dim], 共有num_layers个参数
+    # 每层完整的param的shape是[global_dim, global_dim]
+    param_per_layer_list: List[Parameter] = [get_init_params(num_dim, local_num_dim, rank) for i in range(num_layers)]
+
     # 需要定义优化器
-    optimizer = torch.optim.AdamW(params, lr=1e-3)
+    optimizer = torch.optim.AdamW(param_per_layer_list, lr=1e-3)
 
     num_steps = 10
     for step in range(num_steps):
         optimizer.zero_grad()
 
         # Forward pass
+        # x: [batch, global_dim]
         x = data
-        for i in range(num_layers):
+        for layer_idx in range(num_layers):
             # 1. [关键] 在进入层之前，插入 CopyTo 算子
             # 确保反向传播时，这一处的梯度会被 All-Reduce
-            x = TP_CopyTo.apply(x)
+            # x: [batch, global_dim]
+            # x = TP_CopyTo.apply(x)
 
             # 2. Local Computation
-            # x: [B, D], param: [D, D/world_size] -> result: [B, D/world_size]
-            x = x @ params[i]
+            # x: [batch, global], param: [global, local_dim=global/world_size] 
+            #   -> result: [batch, local_dim=global/world_size]
+            x = x @ param_per_layer_list[layer_idx]
+            # 3. Activation, shape: [batch, local_dim]
             x = F.gelu(x)
 
             # 3. [关键] 使用支持自动求导的 All-Gather
-            # result: [B, D]
-            x = TP_AllGather.apply(x, world_size)
+            # x: [batch, local_dim]
+            # gather => [batch, global_dim]
+            x = TP_AllGather_Op.apply(x, world_size)
 
         # Loss calculation
         loss = x.square().mean()
@@ -757,7 +805,7 @@ def tensor_parallelism_main_auto_grad(rank: int, world_size: int, data: torch.Te
         optimizer.step()
 
         print(f"[tensor_parallelism_auto_grad] Rank {rank}: step={step}, loss={loss.item():.6f}, "
-              f"param_grad_norm={params[0].grad.norm().item():.4f}", flush=True)
+              f"param_grad_norm={param_per_layer_list[0].grad.norm().item():.4f}", flush=True)
 
     cleanup()
 
@@ -766,7 +814,7 @@ def pipeline_parallelism():
 
     data = generate_sample_data()
     #spawn_wrapper(pipeline_parallelism_main, world_size=2, data=data, num_layers=4, num_micro_batches=4)
-    spawn_wrapper(pipeline_parallelism_main_gpipe, world_size=2, data=data, num_layers=4, num_micro_batches=4)
+    spawn_wrapper(pipeline_parallelism_main_gpipe, world_size=4, data=data, num_layers=4, num_micro_batches=4)
 
 
 def pipeline_parallelism_main(rank: int, world_size: int, data: torch.Tensor, num_layers: int, num_micro_batches: int):
@@ -882,23 +930,27 @@ def pipeline_parallelism_main_gpipe(rank: int, world_size: int, data: torch.Tens
         forward_cache = []
 
         #print(f"[Rank {rank}] Starting Forward Pass...")
-        for i in range(num_micro_batches):
+        for micro_index in range(num_micro_batches):
             optimizer.zero_grad() # Note: usually done once per global batch, but here for safety
 
             # --- 1. Receive Input / Get Data ---
             if rank == 0:
                 # Rank 0 gets data directly
-                x = data_chunks[i]
-                # Clone to ensure we don't mess up original data, enable grad for local graph
+                x = data_chunks[micro_index]
+                # Clone to ensure we don't mess up original data, enable grad for local graph, mess up: 弄乱
+                # NOTE：此处x需要梯度
                 x = x.clone().detach().requires_grad_(True)
             else:
                 # Other ranks receive from previous rank
+                # recv_buffer: [micro_batch_size, num_dim]
                 recv_buffer = torch.empty(micro_batch_size, num_dim, device=get_device(rank))
                 dist.recv(tensor=recv_buffer, src=rank - 1)
                 # [Critical] Detach from the communication buffer and start a new computation graph
+                # NOTE：此处x需要梯度
                 x = recv_buffer.detach().requires_grad_(True)
 
             # Keep reference to input `x` (it's the root of our local graph)
+            # x: [micro_batch_size, num_dim]
             input_tensor = x
 
             # --- 2. Local Computation ---
@@ -913,9 +965,10 @@ def pipeline_parallelism_main_gpipe(rank: int, world_size: int, data: torch.Tens
 
             # --- 4. Send Output to Next Rank ---
             if rank < world_size - 1:
-                # Send detached tensor (values only, no graph)
+                # Send detached tensor (values only, no graph), detach() to avoid gradient tracking
                 dist.send(tensor=output_tensor.detach(), dst=rank + 1)
                 # print(f"[Rank {rank}] Sent MB {i} to Rank {rank+1}")
+        # END FORWARD PASS
 
         # ==========================================
         # Backward Pass (GPipe Schedule: All Backward)
@@ -923,9 +976,11 @@ def pipeline_parallelism_main_gpipe(rank: int, world_size: int, data: torch.Tens
 
         #print(f"[Rank {rank}] Starting Backward Pass...")
 
-        # Iterate in reverse order (LIFO)
-        for i in reversed(range(num_micro_batches)):
-            input_tensor, output_tensor = forward_cache[i]
+        # Iterate in reverse order (LIFO: last in first out)
+        for micro_index in reversed(range(num_micro_batches)):
+            # input_tensor: [micro_batch_size, num_dim]
+            # output_tensor: [micro_batch_size, num_dim]
+            input_tensor, output_tensor = forward_cache[micro_index]
 
             # --- 1. Calculate Gradient w.r.t Output ---
             if rank == world_size - 1:
@@ -933,10 +988,11 @@ def pipeline_parallelism_main_gpipe(rank: int, world_size: int, data: torch.Tens
                 loss = output_tensor.square().mean()
                 # Start backward chain
                 loss.backward()
-                print(f"[Rank {rank}] Step {step} micro_batch {i} Loss: {loss.item():.4f}")
+                print(f"[Rank {rank}] Step {step} micro_batch {micro_index} Loss: {loss.item():.4f}")
             else:
-                # Intermediate ranks receive gradient from next rank
-                grad_recv = torch.empty_like(output_tensor)
+                # Intermediate ranks receive gradient from next rank, 中间层从rank+1接收梯度,放到grad_recv中
+                # grad_recv: [micro_batch_size, num_dim]
+                grad_recv: torch.Tensor = torch.empty_like(output_tensor)
                 dist.recv(tensor=grad_recv, src=rank + 1)
 
                 # Continue backward chain: compute grads for local params and input_tensor
@@ -947,6 +1003,7 @@ def pipeline_parallelism_main_gpipe(rank: int, world_size: int, data: torch.Tens
                 # input_tensor.grad contains dL/d(Input)
                 # We send this back to rank-1 to serve as their dL/d(Output)
                 dist.send(tensor=input_tensor.grad, dst=rank - 1)
+        # END BACKWARD PASS
 
         # ==========================================
         # Optimizer Step

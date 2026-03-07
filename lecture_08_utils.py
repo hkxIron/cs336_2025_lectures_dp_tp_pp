@@ -105,12 +105,13 @@ def summarize_tensor(tensor: torch.Tensor) -> str:
 def get_init_params(num_inputs: int, num_outputs: int, rank: int) -> nn.Parameter:
     torch.random.manual_seed(0)  # For reproducibility
     """
+    获取当前device=rank上的参数
+
     参数：
         num_inputs (int): 输入维度
         num_outputs (int): 输出维度
         rank (int): 进程的rank号，用于确定随机数生成器的种子
     初始化参数，使用正态分布随机数，并进行归一化处理。
-
 
     # 缩放后的方差
     Var(scaled) = 1 / num_outputs
