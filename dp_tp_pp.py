@@ -6,11 +6,8 @@ import sys
 from typing import List, Callable
 import torch.nn.functional as F
 import torch.distributed as dist
-import torch.distributed.fsdp
 from torch.nn.parameter import Parameter
-from execute_util import text, image, link, system_text
 from torch_util import get_device
-from lecture_util import article_link
 from lecture_08_utils import spawn_wrapper, int_divide, summarize_tensor, get_init_params, render_duration
 
 """
@@ -22,12 +19,12 @@ stanford cs336: Distributed Training
 """
 
 def main():
-    #torch_distributed()        # How this is implemented in NCCL/PyTorch
-    #benchmarking()             # Measure actual NCCL bandwidth
+    torch_distributed()        # How this is implemented in NCCL/PyTorch
+    benchmarking()             # Measure actual NCCL bandwidth
 
-    #data_parallelism()         # Cut up along the batch dimension
+    data_parallelism()         # Cut up along the batch dimension
     tensor_parallelism()       # Cut up along the width dimension
-    #pipeline_parallelism()     # Cut up along the depth dimension
+    pipeline_parallelism()     # Cut up along the depth dimension
 
 def torch_distributed():
     print("Let's walk through some examples.")
@@ -409,9 +406,8 @@ def data_parallelism():
     print("- Gradients are all-reduced to be the same across ranks")
     print("- Therefore, parameters remain the same across ranks")
 
-
 def generate_sample_data():
-    torch.seed(42)
+    torch.manual_seed(42)
     batch_size = 128
     num_dim = 1024
     data = torch.randn(batch_size, num_dim)
@@ -553,14 +549,14 @@ def tensor_parallelism_main_manual_grad(rank: int, world_size: int, data: torch.
         inputs_cache_per_layer_list:List[torch.Tensor] = [] # 每层的输入的缓存
         prev_activation_cache_per_layer:List[torch.Tensor] = [] # 激活前的结果缓存
 
-        for i in range(num_layers):
+        for layer_idx in range(num_layers):
             # 1. 缓存当前层的输入
             # x: [batch, Global]
             inputs_cache_per_layer_list.append(x)
 
             # 2. 局部计算
             # x: [batch, Global], param: [Global, Local] -> z: [batch, Local]
-            z = x @ param_per_layer_list[i]
+            z = x @ param_per_layer_list[layer_idx]
 
             # 3. 缓存激活前的值 (用于计算GELU的导数)
             prev_activation_cache_per_layer.append(z)
@@ -568,9 +564,76 @@ def tensor_parallelism_main_manual_grad(rank: int, world_size: int, data: torch.
             # 4. 激活函数, shape: [batcch_size, local_num_dim]
             local_activation = F.gelu(z)
 
+            """
+            问题1： 这里all_gather时，并未显式指定gpu0的数据放到activations[0]中， gpu1的数据放到activations[1]中,这样会导致收集到的activation的维度顺序错乱吧？
+                在 PyTorch 的分布式通信（以及底层的 NCCL/MPI 标准）中，all_gather 操作有一个严格的隐式保证（Implicit Guarantee）：
+
+                收集到的 Tensor 在 tensor_list 中的索引，严格等于发送该 Tensor 的进程的 Rank 编号。
+
+                也就是说，当你执行：
+
+                dist.all_gather(tensor_list=activations, tensor=local_activation, async_op=False)
+
+                底层通信后端（通常是 NCCL）会自动按照 Rank 的顺序进行填充：
+
+                Rank 0 的 local_activation 会被精确地放入所有 GPU 的 activations[0] 中。
+                Rank 1 的 local_activation 会被精确地放入所有 GPU 的 activations[1] 中。
+                Rank i 的数据必然在 activations[i] 中。
+                你**不需要（也无法）**在 API 中显式指定“谁放到哪个位置”，因为这是 all_gather 这个算子定义的一部分。
+            
+            问题2：这里 all_gather接收的数据并没有唯一的id标识与确认，如何保证all_gather接受到的数据就是rank_i发过来的当前layer_idx的activation,而不是layer_idx+1的activation或者其它数据？
+
+                这是一个非常深刻且直击分布式系统底层原理的问题！
+
+                在普通的网络通信（比如 HTTP 请求或者 Socket 编程）中，我们确实需要给数据包打上 ID、Sequence Number 或者 Tag，以防止数据错乱。
+
+                但在 PyTorch 的分布式训练（基于 NCCL 或 MPI 后端）中，**`all_gather` 并不需要显式的 ID，也绝对不会把 `layer_idx` 的数据和 `layer_idx + 1` 的数据搞混。**
+
+                这是由以下三个核心机制共同保证的：
+
+                ### 1. SPMD 模型（单程序多数据）与严格的代码执行顺序
+                你的所有 GPU（Rank 0, Rank 1...）运行的是**同一份 Python 代码**。
+                大家都在执行同一个 `for i in range(num_layers):` 循环。
+                * 所有 Rank 都会先执行 `layer 0` 的前向传播，然后遇到 `layer 0` 的 `all_gather`。
+                * 只有完成 `layer 0` 的循环后，才会进入 `layer 1`。
+                因为代码的执行顺序是严格一致的，所以大家调用 `all_gather` 的**先后顺序也是绝对一致的**。
+
+                ### 2. 集合通信（Collective Communication）的“隐式屏障”特性
+                `all_gather` 属于**集合通信（Collective）**算子。集合通信有一个铁律：**所有参与的 Rank 必须全部到达该通信点，通信才能真正发生并完成。**
+
+                假设现在有 Rank 0 和 Rank 1：
+                * 如果 Rank 0 计算得很快，先到达了 `layer 0` 的 `all_gather`，它**不能**自己把数据发出去然后直接进入 `layer 1`。
+                * Rank 0 的底层通信库（NCCL）会**阻塞/等待**，直到 Rank 1 也执行到了 `layer 0` 的 `all_gather`。
+                * 当所有 Rank 都到达了这个“集合点”，NCCL 才会把大家手里的 `local_activation` 交换并拼装。
+                * 交换完成后，大家再**同时**继续往下走，进入 `layer 1`。
+
+                **结论：** 因为这种“互相等待”的机制（隐式 Barrier），Rank 0 永远不可能在等待 `layer 0` 数据的时候，收到 Rank 1 发来的 `layer 1` 数据——因为 Rank 1 根本还没进入 `layer 1`！
+
+                ### 3. GPU Stream 的 FIFO（先进先出）队列机制
+                你可能会问：*“如果 CPU 执行得特别快，瞬间把 10 层的 `all_gather` 指令都下发给 GPU 了怎么办？”*
+
+                即使 CPU 是异步下发指令的，PyTorch 也会将这些计算和通信指令放入 GPU 的 **Stream（指令队列）** 中。GPU Stream 是严格的 **FIFO（先进先出）** 队列。
+
+                * **Rank 0 的 GPU 队列：** `[Layer 0 AllGather] -> [Layer 1 AllGather] -> [Layer 2 AllGather]`
+                * **Rank 1 的 GPU 队列：** `[Layer 0 AllGather] -> [Layer 1 AllGather] -> [Layer 2 AllGather]`
+
+                底层的 NCCL 引擎在处理通信时，是严格按照队列顺序匹配的。它会把所有 Rank 队列里的**第一个** `all_gather` 互相匹配，然后再匹配**第二个**。
+                因此，**“调用的顺序（Sequence）”本身就充当了唯一的 ID。**
+
+                ---
+
+                ### 补充：什么时候才需要显式的 ID（Tag）？
+                在 PyTorch 分布式中，只有当你使用 **点对点通信（Point-to-Point Communication）**，即 `dist.send()` 和 `dist.recv()` 时，你才需要传入一个 `tag` 参数（相当于 ID）。
+
+                因为点对点通信是局部的，Rank 0 可以随时发给 Rank 1，Rank 2 也可以随时发给 Rank 1，这时候 Rank 1 的 `recv` 就必须通过 `tag` 来确认接收的是哪一层、谁发来的数据。
+
+                **总结：**
+                你代码中使用的 `all_gather` 是全局集合通信，依靠**相同的代码执行顺序**和**底层的严格队列匹配**，天生免疫数据错位问题，不需要任何显式 ID。
+
+            """
             # 5. 通信 (All-Gather)
-            # 创建buffer list, 每个buffer的shape是[batch_size, local_num_dim]
-            # NOTE: 这里的buffer是分布在不同的rank上的，而不是在当前rank上, 因此concat时是按照rank的顺序进行的，所以不会出现维度顺序错误
+            # 创建buffer list, 每个buffer的shape是[batch_size, local_num_dim], activations 并不是“分布在不同 GPU 上的 Tensor 列表”，而是当前 GPU 上预先分配好的一组连续内存块（占位符)
+            # NOTE: 在当前 rank (GPU) 上预分配 world_size 个 buffer。all_gather 会将其他 rank 的计算结果通过网络拉取过来，填充到当前 rank 的这些 buffer 中。填充完毕后，所有数据都在当前 GPU 上，因此可以直接 cat
             activations: List[torch.Tensor] = [torch.empty(batch_size, local_num_dim, device=get_device(rank)) for _ in range(world_size)]
             dist.all_gather(tensor_list=activations, tensor=local_activation, async_op=False)
 
@@ -596,7 +659,7 @@ def tensor_parallelism_main_manual_grad(rank: int, world_size: int, data: torch.
         # grad_x = x.grad
 
         # 从最后一层手动向前遍历
-        for i in reversed(range(num_layers)):
+        for layer_idx in reversed(range(num_layers)):
             # --- Step A: 处理 All-Gather 的反向 (Split/Slice) ---
             # 前向是 Concat(AllGather(local))，反向就是切片取出属于当前rank的那部分梯度
             # grad_x shape: [Batch, Global_Dim]
@@ -608,7 +671,7 @@ def tensor_parallelism_main_manual_grad(rank: int, world_size: int, data: torch.
 
             # --- Step B: 处理 Activation (GELU) 的反向 ---
             # d(GELU(z))/dz * grad_output
-            z = prev_activation_cache_per_layer[i]
+            z = prev_activation_cache_per_layer[layer_idx]
             with torch.enable_grad(): # 与no_grad相反
                 # 为了简化数学公式书写，这里我们利用PyTorch的自动求导计算局部元素的gelu导数
                 # (这在手动实现中是允许的，只要不依赖整个图)
@@ -620,8 +683,8 @@ def tensor_parallelism_main_manual_grad(rank: int, world_size: int, data: torch.
             # --- Step C: 处理 MatMul (Z = X @ W) 的反向 ---
             # 我们需要计算 dL/dW 和 dL/dX
             # 原本每层完整的param的shape是[global, global]
-            input_x = inputs_cache_per_layer_list[i] # shape: [Batch, Global_Dim]
-            weight = param_per_layer_list[i]        # shape: [Global_Dim, Local_Dim]
+            input_x = inputs_cache_per_layer_list[layer_idx] # shape: [Batch, Global_Dim]
+            weight = param_per_layer_list[layer_idx]        # shape: [Global_Dim, Local_Dim]
 
             # z = x @ W
             # 1. 计算权重梯度: dL/dW = X^T @ dL/dZ
@@ -654,7 +717,7 @@ def tensor_parallelism_main_manual_grad(rank: int, world_size: int, data: torch.
         # ==========================================
         loss_val = x.square().mean().item()
         grad_norm = param_per_layer_list[0].grad.norm().item() if param_per_layer_list[0].grad is not None else 0
-        print(f"[tensor_parallel_manual_grad][Rank {rank}] Step {step}: Loss = {loss_val:.6f}, Grad Norm (Layer 0) = {grad_norm:.4f}", flush=True)
+        print(f"[tensor_parallel_manual_grad][Use optimizer:{use_optimizer} Rank {rank}] Step {step}: Loss = {loss_val:.6f}, Grad Norm (Layer 0) = {grad_norm:.4f}", flush=True)
 
         if use_optimizer:
             optimizer.step()
@@ -943,6 +1006,75 @@ def pipeline_parallelism_main_gpipe(rank: int, world_size: int, data: torch.Tens
                 # NOTE：此处x需要梯度
                 x = x.clone().detach().requires_grad_(True)
             else:
+                """
+                问题：在上面这段代码中，使用了dist.send,dist.recv但并没有使用tag,  那“ dist.recv(tensor=recv_buffer, src=rank - 1)”如何保证接收的正好是rank-1的micro_index所对应的activation输出，而不是micro_index+1或其它的activation
+                
+                这是一个非常棒的进阶问题！你已经敏锐地察觉到了点对点通信（Point-to-Point Communication，即 `send` 和 `recv`）与集合通信（`all_gather`）的不同。
+
+                在点对点通信中，确实**没有**像 `all_gather` 那样的全局“隐式屏障（Barrier）”来强制所有人对齐。
+
+                那么，为什么这段 GPipe 代码在没有使用 `tag` 的情况下，依然能保证 `micro_index` 绝对不会错乱呢？
+
+                答案的核心在于两个字：**FIFO（First-In-First-Out，先进先出）**。
+
+                具体来说，是由以下两个机制共同保证的：
+
+                ### 1. 底层通信通道的严格 FIFO 保证
+                在 PyTorch 的分布式后端（无论是 NCCL、Gloo 还是 MPI）中，**任意两个特定的 Rank 之间的通信通道，是严格保证先进先出（FIFO）的。**
+
+                你可以把 Rank 0 到 Rank 1 之间的网络连接想象成一根**实体水管**：
+                * Rank 0 往水管里塞入第一个球（`micro_index=0` 的数据）。
+                * Rank 0 接着塞入第二个球（`micro_index=1` 的数据）。
+                * 因为水管很窄，球不能互相超越。所以 Rank 1 在水管另一头接收时，**第一个掉出来的绝对是第一个球，第二个掉出来的绝对是第二个球。**
+
+                在没有显式指定 `tag` 的情况下，PyTorch 会默认给所有 `send/recv` 分配一个相同的默认 tag（通常是 0）。当所有消息的 tag 都相同时，底层引擎就会**完全依赖发送和接收的先后顺序（队列顺序）来进行匹配**。
+
+                ### 2. 所有 Rank 的循环顺序（代码逻辑）严格一致
+                我们来看看前向传播（Forward Pass）时，相邻两个 Rank 的代码执行轨迹：
+
+                **Rank 0 的视角：**
+                1. `micro_index = 0`: 计算 MB_0 -> `dist.send(MB_0, dst=1)` （塞入第 1 个球）
+                2. `micro_index = 1`: 计算 MB_1 -> `dist.send(MB_1, dst=1)` （塞入第 2 个球）
+                3. `micro_index = 2`: 计算 MB_2 -> `dist.send(MB_2, dst=1)` （塞入第 3 个球）
+
+                **Rank 1 的视角：**
+                1. `micro_index = 0`: `dist.recv(src=0)` （等待并接住第 1 个球）-> 计算 MB_0
+                2. `micro_index = 1`: `dist.recv(src=0)` （等待并接住第 2 个球）-> 计算 MB_1
+                3. `micro_index = 2`: `dist.recv(src=0)` （等待并接住第 3 个球）-> 计算 MB_2
+
+                因为 Rank 0 和 Rank 1 都在执行 `for micro_index in range(num_micro_batches):`，它们的**调用顺序是完美镜像对齐的**。
+                * Rank 1 的第 1 次 `recv`，必然匹配 Rank 0 的第 1 次 `send`。
+                * Rank 1 的第 2 次 `recv`，必然匹配 Rank 0 的第 2 次 `send`。
+
+                **反向传播（Backward Pass）同理：**
+                反向传播使用了 `reversed(range(num_micro_batches))`。
+                * Rank 1 会依次 `send` 梯度：MB_2, MB_1, MB_0。
+                * Rank 0 会依次 `recv` 梯度：MB_2, MB_1, MB_0。
+                顺序依然是完美对齐的，FIFO 队列再次保证了数据不会错位。
+
+                ---
+
+                ### 什么时候才【必须】使用 `tag`？
+
+                理解了为什么这里不需要 `tag`，我们再来看看什么情况下**必须**用 `tag`。
+
+                只有当**接收方的 `recv` 顺序与发送方的 `send` 顺序可能不一致**，或者**存在多个发送方竞争**时，才必须用 `tag`。
+
+                **场景举例：动态路由 / 异步参数服务器**
+                假设 Rank 1 是一个参数服务器，Rank 0 和 Rank 2 是工作节点。
+                * Rank 0 计算完了，向 Rank 1 发送梯度。
+                * Rank 2 也计算完了，向 Rank 1 发送梯度。
+                * Rank 1 此时执行 `dist.recv(src=ANY)`。因为网络延迟，Rank 1 不知道先到达的是 Rank 0 的数据还是 Rank 2 的数据。
+                * 如果 Rank 1 需要区分“这是哪一层的梯度”或者“这是哪个 micro_batch 的梯度”，因为到达顺序是**乱序**的，它就必须依赖 `tag` 来识别数据包的身份。
+
+                ### 总结
+                在你的 GPipe 流水线并行代码中：
+                1. 通信是**点对点、单向**的（Rank 0 -> Rank 1）。
+                2. 发送和接收的**代码循环顺序是静态且完全一致**的。
+                3. 底层网络保证了**FIFO（先进先出）**。
+
+                这三点结合在一起，使得“调用的先后顺序”本身就起到了 `tag` 的作用，因此不需要显式指定 `tag`，数据也绝对不会错乱。
+                """
                 # Other ranks receive from previous rank
                 # recv_buffer: [micro_batch_size, num_dim]
                 recv_buffer = torch.empty(micro_batch_size, num_dim, device=get_device(rank))
