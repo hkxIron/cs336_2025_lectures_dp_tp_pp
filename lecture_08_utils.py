@@ -129,6 +129,7 @@ def get_init_params(num_inputs: int, num_outputs: int, rank: int) -> nn.Paramete
     std = math.sqrt(2 / num_inputs)
     nn.init.kaiming_normal_(tensor, mode='fan_in')
     """
+    # 当前的参数放在设备rank上
     return nn.Parameter(torch.randn(num_inputs, num_outputs, device=get_device(rank)) / math.sqrt(num_outputs))
 
 

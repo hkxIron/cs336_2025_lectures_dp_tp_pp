@@ -22,12 +22,12 @@ stanford cs336: Distributed Training
 """
 
 def main():
-    # torch_distributed()        # How this is implemented in NCCL/PyTorch
-    # benchmarking()             # Measure actual NCCL bandwidth
+    #torch_distributed()        # How this is implemented in NCCL/PyTorch
+    #benchmarking()             # Measure actual NCCL bandwidth
 
-    # data_parallelism()         # Cut up along the batch dimension
-    #tensor_parallelism()       # Cut up along the width dimension
-    pipeline_parallelism()     # Cut up along the depth dimension
+    #data_parallelism()         # Cut up along the batch dimension
+    tensor_parallelism()       # Cut up along the width dimension
+    #pipeline_parallelism()     # Cut up along the depth dimension
 
 def torch_distributed():
     print("Let's walk through some examples.")
@@ -312,6 +312,7 @@ def all_reduce(rank: int, world_size: int, num_elements: int):
     # 自认为正确的实现
     # 对于 Ring All-Reduce 算法
     # 每个进程发送和接收的数据量
+    # 每个数据reduce时先发送一次到目标rank,然后gather时再发送至所有的rank，所以总共是2次网络传播
     per_process_bytes_sent = 2 * (world_size - 1) * size_bytes / world_size
     total_bytes_sent = world_size * per_process_bytes_sent
     # 聚合带宽 = 总传输数据量 / 总时间
@@ -565,12 +566,13 @@ def tensor_parallelism_main_manual_grad(rank: int, world_size: int, data: torch.
             prev_activation_cache_per_layer.append(z)
 
             # 4. 激活函数, shape: [batcch_size, local_num_dim]
-            local_act = F.gelu(z)
+            local_activation = F.gelu(z)
 
             # 5. 通信 (All-Gather)
             # 创建buffer list, 每个buffer的shape是[batch_size, local_num_dim]
+            # NOTE: 这里的buffer是分布在不同的rank上的，而不是在当前rank上, 因此concat时是按照rank的顺序进行的，所以不会出现维度顺序错误
             activations: List[torch.Tensor] = [torch.empty(batch_size, local_num_dim, device=get_device(rank)) for _ in range(world_size)]
-            dist.all_gather(tensor_list=activations, tensor=local_act, async_op=False)
+            dist.all_gather(tensor_list=activations, tensor=local_activation, async_op=False)
 
             # 6. 拼接
             # shape: [batcch_size, local_num_dim] 
