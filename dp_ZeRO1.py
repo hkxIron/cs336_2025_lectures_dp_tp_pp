@@ -3,7 +3,7 @@ import torch
 import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn import Parameter
-from typing import List
+from typing import Any, Dict, List, Optional
 from dp_tp_pp import generate_sample_data, get_init_params, int_divide, get_device, get_device, setup, cleanup
 from torch_util import get_device
 from lecture_08_utils import spawn_wrapper, int_divide, summarize_tensor, get_init_params, render_duration
@@ -40,7 +40,8 @@ def manual_zero_stage1_gpu(rank: int, world_size: int, data: torch.Tensor, num_l
         * **总通信量依然是 $1 \times \text{模型参数量}$**！ZeRO-1 在**不增加任何通信开销**的前提下，把优化器状态的显存给切分了，这就是它被称为“免费午餐”的原因。
 
     3. **手动 AdamW 的无缝接入**：
-    我们直接把之前手写的 AdamW 逻辑嵌入到了 `Step 3` 中。注意，所有的数学运算（`mul_`, `add_`, `addcmul_`, `addcdiv_`）都是在 `local_param` 和 `local_grad` 上进行的，这保证了计算量也被均摊到了各个 GPU 上。
+    我们直接把之前手写的 AdamW 逻辑嵌入到了 `Step 3` 中。注意，所有的数学运算（`mul_`, `add_`, `addcmul_`, `addcdiv_`）都是在 `local_param` 和 `local_grad` 上进行的，
+    这保证了计算量也被均摊到了各个 GPU 上。
 
 
     addcmul_:
@@ -98,15 +99,15 @@ def manual_zero_stage1_gpu(rank: int, world_size: int, data: torch.Tensor, num_l
     # 2. 模型参数初始化
     # ==========================================
     # 每个 rank 依然需要完整的模型参数来进行前向和反向传播
-    params: List[Parameter] = [get_init_params(num_dim, num_dim, rank) for _ in range(num_layers)]
+    params: List[Parameter] = [get_init_params(num_dim, num_dim, rank) for _ in range(num_layers)] # 注意：参数params均在当前rank上
 
     # ==========================================
     # 3. ZeRO-1 优化器状态初始化 (核心改变)
     # ==========================================
     # 我们不再使用 torch.optim.AdamW，而是手动维护局部的优化器状态
     # 每个 rank 只维护 1/world_size 的参数对应的 exp_avg 和 exp_avg_sq
-    local_chunk_size = int_divide(num_dim, world_size)
-    optim_states = {}
+    local_chunk_size = int_divide(num_dim, world_size) # num_dim / world_size
+    optim_states :Dict[str, Any]= {} # 这个是全局的内存，直到程序结束才会释放
 
     # AdamW 超参数
     lr = 1e-3
@@ -120,84 +121,107 @@ def manual_zero_stage1_gpu(rank: int, world_size: int, data: torch.Tensor, num_l
         # ==========================================
         # 前向传播
         x = local_data
-        for param in params:
-            x = x @ param
+        for layer_param in params:
+            x = x @ layer_param
             x = F.gelu(x)
 
         loss = x.square().mean()
 
-        # 反向传播，计算出完整的梯度 param.grad
+        # 反向传播，计算出完整的梯度param.grad, NOTE: 现在每个rank上都有完整的梯度
         loss.backward()
 
         # ==========================================
         # ZeRO-1 通信与参数更新阶段
         # ==========================================
-        for param_idx, param in enumerate(params):
+        for layer_param_idx, layer_param in enumerate(params):
             # 确保梯度存在
-            if param.grad is None:
+            if layer_param.grad is None:
                 continue
 
             # --- Step 2: ReduceScatter the gradients ---
-            # 将完整的梯度 [num_dim, num_dim] 沿 dim=0 切分成 world_size 份
-            grad_chunks: List[torch.Tensor] = list(torch.chunk(param.grad, world_size, dim=0))
+            # 将完整的梯度 [num_dim, num_dim] 沿 dim=0 切分成 world_size 份, 每份大小为 [num_dim / world_size, num_dim]
+            # NOTE:每个chunk均为param.grad的一个view,即共享内存, 参数均在当前rank上
+            grad_chunks: List[torch.Tensor] = list(torch.chunk(layer_param.grad, world_size, dim=0)) 
             # 必须保证内存连续，以便进行底层通信
             grad_chunks = [chunk.contiguous() for chunk in grad_chunks]
 
-            # 准备接收局部梯度的 buffer
-            local_grad = torch.empty_like(grad_chunks[0])
+            # 准备接收局部梯度的buffer
+            # local_grad: [num_dim / world_size, num_dim]
+            local_grad: torch.Tensor = torch.empty_like(grad_chunks[0], device=grad_chunks[0].device)
 
-            # ReduceScatter: 将所有 rank 的 grad_chunks 对应位置相加求平均，
-            # 然后 rank i 只拿走第 i 个 chunk 存入 local_grad
-            dist.reduce_scatter(output=local_grad, input_list=grad_chunks, op=dist.ReduceOp.AVG)
+            # ReduceScatter: 将所有 rank 的 grad_chunks 对应位置的梯度local_grad相加求平均， 想像RingAllReduce
+            # 然后 rank i 只拿走第 i 个 chunk 并存入 local_grad, reduce_scatter会严格按照chunk顺序进行数据收集
+            # 通信量：(N-1)/N * params_num ~= params_num = 0.5 * DDP通信量
+            dist.reduce_scatter(output=local_grad, input_list=grad_chunks, op=dist.ReduceOp.AVG) # 先分片再reduce再send, 严格按照chunk顺序进行数据分片再发送
 
-            # --- Step 3: Each machine updates their param using their gradient + state ---
+            # --- Step 3: Each machine updates their param using their gradient + partial state ---
             # 提取当前 rank 负责更新的那部分参数 (克隆出来以避免影响原计算图)
-            chunk_start = rank * local_chunk_size
-            chunk_end = chunk_start + local_chunk_size
-            local_param = param.data[chunk_start:chunk_end].clone()
+            chunk_start: int = rank * local_chunk_size
+            chunk_end: int = chunk_start + local_chunk_size
+            # local_param: [num_dim / world_size, num_dim]，参数沿第0维切分
+            # NOTE: local_param是一个新的data, 不与原layer_param共享内存，在Deepspeed中local_param与原layer_param的类型也不同，可采用高精度数据类型如float32
+            # 不与layer_param共享内存的原因是adamw在计算时会经常修改其值, 且数据类型也不同
+            local_param: torch.Tensor = layer_param.data[chunk_start:chunk_end].clone()
 
             # 初始化局部优化器状态 (仅在第一步执行)
-            if param_idx not in optim_states:
-                optim_states[param_idx] = {
+            if layer_param_idx not in optim_states:
+                optim_states[layer_param_idx] = {
                     'step': 0,
-                    'exp_avg': torch.zeros_like(local_param),    # 显存占用仅为原来的 1/world_size!
-                    'exp_avg_sq': torch.zeros_like(local_param)  # 显存占用仅为原来的 1/world_size!
+                    'exp_avg': torch.zeros_like(local_param, device=local_param.device),    # 显存占用仅为原来的 1/world_size!
+                    'exp_avg_sq': torch.zeros_like(local_param, device=local_param.device)  # 显存占用仅为原来的 1/world_size!
                 }
 
-            state = optim_states[param_idx]
+            state = optim_states[layer_param_idx]
             state['step'] += 1
             t = state['step']
+            # 一阶和二阶矩 (仅在当前 rank 上计算)
             exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
 
             # [手动 AdamW 逻辑]
-            # 1. 解耦的权重衰减 (Decoupled Weight Decay)
+            # 1. 解耦的权重衰减 (Decoupled Weight Decay), 先在param上减去weight_decay
+            # local_param: [num_dim / world_size, num_dim]
+            # w(t) = w(t-1) * (1 - lr * weight_decay)
             local_param.mul_(1 - lr * weight_decay)
 
             # 2. 更新一阶和二阶矩
+            # m_(t) = beta1 * m_(t-1) + (1 - beta1) * grad
             exp_avg.mul_(beta1).add_(local_grad, alpha=1 - beta1)
+            # v_(t) = beta2 * v_(t-1) + (1 - beta2) * grad^2 => exp_avg_sq * beta2 += local_grad^2 * (1 - beta2)
             exp_avg_sq.mul_(beta2).addcmul_(local_grad, local_grad, value=1 - beta2)
 
             # 3. 偏差校正
-            bias_correction1 = 1 - beta1 ** t
+            # 由于 $m_0$ 和 $v_0$ 初始化为 0，在训练初期它们会严重偏向于 0。因此需要除以 $(1 - \beta^t)$ 进行放大校正：
+            bias_correction1 = 1 - beta1 ** t # 注意t从1开始，所以不会为0
             bias_correction2 = 1 - beta2 ** t
             step_size = lr / bias_correction1
+            # m(t) = m(t-1) / (1 - beta1^t)
+            # v(t) = v(t-1) / (1 - beta2^t)
+            # denom: sqrt(v(t))/(1 - beta2^t) + eps
             denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(eps)
 
             # 4. 更新局部参数
+            # w(t) = w(t-1) - lr * m(t) / (sqrt(v(t)) + eps)
+            # local_param: [num_dim / world_size, num_dim] => param+= exp_avg/denorm * (-step_size)
             local_param.addcdiv_(exp_avg, denom, value=-step_size)
 
             # --- Step 4: All Gather the parameters ---
-            # 准备接收所有 rank 更新后的局部参数的 buffer
-            gathered_params: List[torch.Tensor] = [torch.empty_like(local_param) for _ in range(world_size)]
+            # 准备接收所有 rank 更新后的局部参数的buffer
+            # gathered_params: 有world_size个[num_dim / world_size, num_dim], 若未指定device，则默认为local_param所在的device
+            gathered_params: List[torch.Tensor] = [torch.empty_like(local_param, device=local_param.device) for _ in range(world_size)]
+            #gathered_params = [None for _ in range(world_size)] # 如果使用None会报错
 
             # AllGather: 将每个 rank 的 local_param 收集起来，填入 gathered_params 列表
+            # 通信量：(N-1)/N * params_num ~= params_num = 0.5 * DDP通信量
+            # 因此总通信量 = reduce_scatter通信量 + all_gather通信量 = 1 * params_num = DDP通信量, 相对于DDP通信量无额外开销
+            # NOTE: all_gather收集到的 Tensor 在 tensor_list 中的索引，严格等于发送该 Tensor 的进程的 Rank 编号, 底层通信后端（通常是 NCCL）会⾃动按照 Rank 的顺序进⾏填充
             dist.all_gather(tensor_list=gathered_params, tensor=local_param)
 
             # 将收集到的更新后的参数拼接起来，覆盖回原始的完整参数中
-            param.data.copy_(torch.cat(gathered_params, dim=0))
+            # world_size个[num_dim / world_size, num_dim] => [num_dim, num_dim]
+            layer_param.data.copy_(torch.cat(gathered_params, dim=0)) # 原地修改本地模型参数
 
             # 清空梯度，为下一步做准备
-            param.grad = None
+            layer_param.grad = None
 
         # 打印验证
         print(f"[ZeRO-stage1] Rank {rank}: step = {step}, loss = {loss.item():.6f}, "

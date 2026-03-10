@@ -20,22 +20,30 @@ from typing import List
 # ==========================================
 class ZeRO3Linear(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, local_param, world_size, rank, num_dim):
+    def forward(ctx, x:torch.Tensor, local_param:Parameter, world_size:int, rank:int, num_dim:int):
         """
         前向传播：Gather 参数 -> 计算 -> 释放参数
         """
         # 1. 分配临时显存，用于存放完整的参数
         full_param = torch.empty(num_dim, num_dim, dtype=local_param.dtype, device=local_param.device)
 
-        # 2. 【通信】All-Gather: 收集所有 rank 的 local_param 拼成 full_param
+        # 2. 【通信】All-Gather: 收集所有 rank 的 local_param 拼成 full_param, 通信量：param_num
+        # local_param:[num_dim/word_size, num_dim]
+        # all_gather=> 收集全部的参数并封状成tensor
+        # full_param:[num_dim, num_dim]
         dist.all_gather_into_tensor(output_tensor=full_param, input_tensor=local_param)
 
-        # 3. 【计算】使用完整参数进行前向计算
+        # 3. 【计算】使用完整参数进行前向计算, 得到完整参数后执行前向计算
+        # x: [local_batch_size, num_dim]
+        # full_param:[num_dim, num_dim]
+        # out:[local_batch_size, num_dim]
         out = x @ full_param
 
         # 4. 保存反向传播需要的上下文
         # 注意：我们只保存输入 x，绝对不保存 full_param！
+        # x: [local_batch_size, num_dim]
         ctx.save_for_backward(x)
+        # local_param:[num_dim/word_size, num_dim]
         ctx.local_param = local_param  # 保存局部参数的引用
         ctx.world_size = world_size
         ctx.num_dim = num_dim
@@ -48,35 +56,47 @@ class ZeRO3Linear(torch.autograd.Function):
         """
         反向传播：Gather 参数 -> 算梯度 -> 释放参数 -> Reduce-Scatter 梯度 -> 释放完整梯度
         """
+        # x: [local_batch_size, num_dim]
         x, = ctx.saved_tensors
         local_param = ctx.local_param
         world_size = ctx.world_size
         num_dim = ctx.num_dim
 
-        # 1. 【通信】再次 All-Gather: 反向传播也需要完整的参数
+        # 1. 【通信】再次 All-Gather: 反向传播也需要完整的参数, 通信量：param_num
+        # local_param:[num_dim/word_size, num_dim]
+        # full_param:[num_dim, num_dim]
         full_param = torch.empty(num_dim, num_dim, dtype=local_param.dtype, device=local_param.device)
         dist.all_gather_into_tensor(output_tensor=full_param, input_tensor=local_param)
 
         # 2. 【计算】计算对输入 x 的梯度 (传给上一层)
+        # grad_out: [local_batch_size, num_dim]
+        # full_param:[num_dim, num_dim]
+        # grad_x: [local_batch_size, num_dim]
         grad_x = grad_out @ full_param.T
 
         # 3. 【计算】计算对完整参数的梯度
+        # x: [local_batch_size, num_dim]
+        # grad_out: [local_batch_size, num_dim]
+        # grad_full_param:[num_dim, num_dim]
+        # dL/dW = x^T * grad_out
         grad_full_param = x.T @ grad_out
 
         # 4. 【阅后即焚】完整参数用完了，立刻手动释放！
         del full_param 
 
-        # 5. 【通信】Reduce-Scatter: 把完整的参数梯度切分，每个 rank 只拿 1/world_size
+        # 5. 【通信】Reduce-Scatter: 把完整的参数梯度切分，每个 rank 只拿 1/world_size, 通信量：param_num
         local_chunk_size = num_dim // world_size
         local_grad = torch.empty(local_chunk_size, num_dim, dtype=grad_full_param.dtype, device=grad_full_param.device)
+        # 将各rank上的参数的梯度进行平均,收集到local_grad中
         dist.reduce_scatter_tensor(output=local_grad, input=grad_full_param, op=dist.ReduceOp.AVG)
 
         # 6. 【阅后即焚】完整的梯度用完了，立刻释放！(函数返回后 grad_full_param 被销毁)
 
+        # grad_x: [local_batch_size, num_dim]
+        # local_grad: [local_chunk_size=num_dim/world_size, num_dim]
         # 返回的梯度顺序必须与 forward 的输入参数顺序一致
         # x 的梯度是 grad_x, local_param 的梯度是 local_grad
         return grad_x, local_grad, None, None, None
-
 
 def manual_zero_stage3_gpu(rank: int, world_size: int, data: torch.Tensor, num_layers: int, num_steps: int):
     """
@@ -114,7 +134,6 @@ def manual_zero_stage3_gpu(rank: int, world_size: int, data: torch.Tensor, num_l
     下面是纯 GPU (NCCL) 环境下的 **ZeRO-3** 完整实现：
     """
 
-
     setup(rank, world_size)
     print(f"[Rank:{rank}]Zero stage 3 (GPU)")
     device = get_device(rank)
@@ -128,19 +147,22 @@ def manual_zero_stage3_gpu(rank: int, world_size: int, data: torch.Tensor, num_l
     # 1. ZeRO-3 模型参数初始化 (彻底切分)
     # ==========================================
     local_chunk_size = int_divide(num_dim, world_size)
-    local_params: List[Parameter] = []
+    # local_params_all_layers: [local_num_dim=num_dim/world_size, num_dim], 将每层的本地参数放在list中
+    local_params_all_layers: List[Parameter] = []
 
     for _ in range(num_layers):
-        # 假设 get_init_params 返回的是全局一致的完整初始权重
-        full_init_param = get_init_params(num_dim, num_dim, rank)
+        # 假设 get_init_param_temp 返回的是全局一致的完整初始权重, 使用完毕后就直接释放了, 所以不会长期占用GPU显存
+        full_init_param_temp: Parameter = get_init_params(num_dim, num_dim, rank)
 
         # 每个 rank 只截取属于自己的那 1/world_size 作为真正的 Parameter！
         chunk_start = rank * local_chunk_size
         chunk_end = chunk_start + local_chunk_size
 
         # 显存占用从一开始就只有 1/world_size
-        local_param = Parameter(full_init_param[chunk_start:chunk_end].clone().to(device))
-        local_params.append(local_param)
+        # local_param: [local_num_dim=num_dim/world_size, num_dim], 注意这里是clone()出来的, 而不是view()共享内存
+        local_param = Parameter(full_init_param_temp[chunk_start:chunk_end].clone().to(device))
+        local_params_all_layers.append(local_param)
+    # end for
 
     # ==========================================
     # 2. 优化器状态初始化
@@ -156,8 +178,11 @@ def manual_zero_stage3_gpu(rank: int, world_size: int, data: torch.Tensor, num_l
         # 前向传播 (调用自定义的 ZeRO3Linear)
         # ==========================================
         x = local_data
-        for local_param in local_params:
+        for local_param in local_params_all_layers:
             # 魔法发生在这里：自动 Gather -> 计算 -> 释放
+            # x: [local_batch_size, num_dim]
+            # local_param: [local_num_dim=num_dim/world_size, num_dim] => gather -> compute -> free => full_param: [local_batch_size, num_dim]
+            # x: [local_batch_size, num_dim]
             x = ZeRO3Linear.apply(x, local_param, world_size, rank, num_dim)
             x = F.gelu(x)
 
@@ -171,23 +196,23 @@ def manual_zero_stage3_gpu(rank: int, world_size: int, data: torch.Tensor, num_l
         loss.backward()
 
         # ==========================================
-        # 参数更新阶段 (完全没有通信！)
+        # 参数更新阶段 (完全没有通信！), 只更新本地的优化器状态即可
         # ==========================================
-        for param_idx, local_param in enumerate(local_params):
+        for layer_param_idx, local_param in enumerate(local_params_all_layers):
             if local_param.grad is None:
                 continue
-
+            # local_grad: [local_chunk_size=num_dim/world_size, num_dim]
             local_grad = local_param.grad
 
             # 初始化局部优化器状态
-            if param_idx not in optim_states:
-                optim_states[param_idx] = {
+            if layer_param_idx not in optim_states:
+                optim_states[layer_param_idx] = {
                     'step': 0,
                     'exp_avg': torch.zeros_like(local_param),
                     'exp_avg_sq': torch.zeros_like(local_param)
                 }
 
-            state = optim_states[param_idx]
+            state = optim_states[layer_param_idx]
             state['step'] += 1
             t = state['step']
             exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
@@ -202,17 +227,19 @@ def manual_zero_stage3_gpu(rank: int, world_size: int, data: torch.Tensor, num_l
             bias_correction2 = 1 - beta2 ** t
             step_size = lr / bias_correction1
             denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(eps)
-
             local_param.data.addcdiv_(exp_avg, denom, value=-step_size)
 
             # 清理梯度
             local_param.grad = None
+        # end for
 
         # 打印验证 (注意：这里打印的 params 已经是切片后的 local_param 了)
         print(f"[ZeRO-3 GPU] Rank {rank}: step = {step}, loss = {loss.item():.6f}, "
-              f"local_params_shape = {local_params[0].shape}", flush=True)
+              f"local_params_shape = {local_params_all_layers[0].shape}", flush=True)
+    # end for
 
     cleanup()
+
 
 if  __name__ == "__main__":
     data = generate_sample_data()

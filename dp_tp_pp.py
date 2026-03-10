@@ -634,7 +634,7 @@ def tensor_parallelism_main_manual_grad(rank: int, world_size: int, data: torch.
             # 5. 通信 (All-Gather)
             # 创建buffer list, 每个buffer的shape是[batch_size, local_num_dim], activations 并不是“分布在不同 GPU 上的 Tensor 列表”，而是当前 GPU 上预先分配好的一组连续内存块（占位符)
             # NOTE: 在当前 rank (GPU) 上预分配 world_size 个 buffer。all_gather 会将其他 rank 的计算结果通过网络拉取过来，填充到当前 rank 的这些 buffer 中。填充完毕后，所有数据都在当前 GPU 上，因此可以直接 cat
-            activations: List[torch.Tensor] = [torch.empty(batch_size, local_num_dim, device=get_device(rank)) for _ in range(world_size)]
+            activations: List[torch.Tensor] = [torch.empty(batch_size, local_num_dim, device=get_device(rank)) for _ in range(world_size)] 
             dist.all_gather(tensor_list=activations, tensor=local_activation, async_op=False)
 
             # 6. 拼接
