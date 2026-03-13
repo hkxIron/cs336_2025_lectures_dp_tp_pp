@@ -23,6 +23,9 @@ class ZeRO3Linear(torch.autograd.Function):
     def forward(ctx, x:torch.Tensor, local_param:Parameter, world_size:int, rank:int, num_dim:int):
         """
         前向传播：Gather 参数 -> 计算 -> 释放参数
+        与TP不同的是， ZeRO-3 的前向传播需要收集所有 rank 的 local_param 拼成 full_param, 通信量：param_num, 而TP里的前向传播只需要local_param, 一般先ColumnParellism + RowParellism
+
+        每层的参数均被切分成N份，每个rank上只有1/N的参数
         """
         # 1. 分配临时显存，用于存放完整的参数
         full_param = torch.empty(num_dim, num_dim, dtype=local_param.dtype, device=local_param.device)
@@ -84,7 +87,7 @@ class ZeRO3Linear(torch.autograd.Function):
         # 4. 【阅后即焚】完整参数用完了，立刻手动释放！
         del full_param 
 
-        # 5. 【通信】Reduce-Scatter: 把完整的参数梯度切分，每个 rank 只拿 1/world_size, 通信量：param_num
+        # 5. 【通信】Reduce-Scatter: 把完整的grad梯度切分，每个 rank 只拿 1/world_size, 通信量：param_num
         local_chunk_size = num_dim // world_size
         local_grad = torch.empty(local_chunk_size, num_dim, dtype=grad_full_param.dtype, device=grad_full_param.device)
         # 将各rank上的参数的梯度进行平均,收集到local_grad中

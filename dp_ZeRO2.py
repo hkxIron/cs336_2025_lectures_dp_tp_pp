@@ -51,34 +51,37 @@ def manual_zero_stage2_gpu(rank: int, world_size: int, data: torch.Tensor, num_l
     params: List[Parameter] = [get_init_params(num_dim, num_dim, rank) for _ in range(num_layers)]
     local_chunk_size = int_divide(num_dim, world_size)
 
+    # NOTE: 将每层的参数按world_size切分，每个rank只维护1/word_size的参数!!!
+    def reduce_scatter_and_free_grad_hook(p: Parameter):
+        # NOTE: 每算完一层grad，立即触发! 算完层 layer_idx 梯度后立即触发 -> ReduceScatter -> 删掉层 layer_idx 的梯度
+        if p.grad is None:
+            return
+
+        # 1. 分配一块极小的显存，用于接收属于当前 rank 的那 1/world_size 的梯度, 放在param的device上
+        # shape: [local_chunk_size=num_dim/world_size, num_dim]
+        local_grad = torch.empty(local_chunk_size, num_dim, dtype=p.grad.dtype, device=p.grad.device)
+
+        # 2. 【纯 GPU 高性能 API】Reduce-Scatter Tensor
+        # p.grad: [num_dim, num_dim], p.local_grad: [num_dim/world_size, num_dim]
+        # 它会自动将 p.grad 沿 dim=0 切分成 world_size 份，求平均后，把属于当前 rank 的那份直接写入 local_grad
+        dist.reduce_scatter_tensor(output=local_grad, input=p.grad, op=dist.ReduceOp.AVG)
+
+        # 3. 保存局部梯度
+        # shape: [local_chunk_size=num_dim/world_size, num_dim]
+        p.local_grad = local_grad
+
+        # 4. 【ZeRO-2 的灵魂】立刻释放完整的梯度内存！妙！
+        p.grad = None 
+    # end of function
+
     # ==========================================
     # 3. ZeRO-2 核心：注册反向传播 Hook (阅后即焚)
     # ==========================================
-    for param in params:
-        def reduce_scatter_and_free_grad_hook(p: Parameter):
-            # NOTE: 每算完一层grad，立即触发! 算完层 layer_idx 梯度后立即触发 -> ReduceScatter -> 删掉层 layer_idx 的梯度
-            if p.grad is None:
-                return
-
-            # 1. 分配一块极小的显存，用于接收属于当前 rank 的那 1/world_size 的梯度, 放在param的device上
-            # shape: [local_chunk_size=num_dim/world_size, num_dim]
-            local_grad = torch.empty(local_chunk_size, num_dim, dtype=p.grad.dtype, device=p.grad.device)
-
-            # 2. 【纯 GPU 高性能 API】Reduce-Scatter Tensor
-            # p.grad: [num_dim, num_dim], p.local_grad: [num_dim/world_size, num_dim]
-            # 它会自动将 p.grad 沿 dim=0 切分成 world_size 份，求平均后，把属于当前 rank 的那份直接写入 local_grad
-            dist.reduce_scatter_tensor(output=local_grad, input=p.grad, op=dist.ReduceOp.AVG)
-
-            # 3. 保存局部梯度
-            # shape: [local_chunk_size=num_dim/world_size, num_dim]
-            p.local_grad = local_grad
-
-            # 4. 【ZeRO-2 的灵魂】立刻释放完整的梯度内存！妙！
-            p.grad = None 
-
+    for layer_param in params:
+        # NOTE: 每算完一层grad，立即触发! 算完层 layer_idx 梯度后立即触发 -> ReduceScatter -> 删掉层 layer_idx 的梯度
         # 注册 Hook (PyTorch >= 2.1)
-        if hasattr(param, 'register_post_accumulate_grad_hook'):
-            param.register_post_accumulate_grad_hook(reduce_scatter_and_free_grad_hook)
+        if hasattr(layer_param, 'register_post_accumulate_grad_hook'):
+            layer_param.register_post_accumulate_grad_hook(reduce_scatter_and_free_grad_hook)
         else:
             raise RuntimeError("ZeRO-2 requires PyTorch >= 2.1")
 
@@ -95,9 +98,9 @@ def manual_zero_stage2_gpu(rank: int, world_size: int, data: torch.Tensor, num_l
         # 前向传播
         # x: [local_batch_size, num_dim]
         x = local_data
-        for param in params:
+        for layer_param in params:
             # x: [local_batch_size, num_dim]
-            x = x @ param
+            x = x @ layer_param
             x = F.gelu(x)
 
         loss = x.square().mean()
@@ -108,32 +111,34 @@ def manual_zero_stage2_gpu(rank: int, world_size: int, data: torch.Tensor, num_l
         # backward() 执行期间，Hook 会被逐层触发。
         # 算完一层 -> ReduceScatter -> 删掉完整梯度。
         # 显存峰值被完美压平！
-        loss.backward()
+        loss.backward() # NOTE: 这里会逐层触发Hook
 
         # ==========================================
-        # 参数更新阶段
+        # adamw参数更新阶段
         # ==========================================
-        for param_idx, param in enumerate(params):
-            if not hasattr(param, 'local_grad') or param.local_grad is None:
+        for layer_param_idx, layer_param in enumerate(iterable=params):
+            if not hasattr(layer_param, 'local_grad') or layer_param.local_grad is None:
                 continue
-            # NOTE:现在使用的是局部梯度param.local_grad，而不是完整的梯度param.grad
-            local_grad = param.local_grad
+            # NOTE:现在使用的是局部梯度param.local_grad，而不是完整的梯度param.grad!!!
+            # local_grad: [local_chunk_size=num_dim/world_size, num_dim], 只取一部分梯度
+            local_grad = layer_param.local_grad
 
             # 提取当前 rank 负责更新的那部分参数的【视图 View】
             # 注意：这里没有使用 clone()，我们直接在原参数的内存地址上进行原地修改！
             chunk_start = rank * local_chunk_size
             chunk_end = chunk_start + local_chunk_size
-            local_param = param.data[chunk_start:chunk_end]
+            # local_param: [local_chunk_size=num_dim/world_size, num_dim], 只取一部分param
+            local_param = layer_param.data[chunk_start:chunk_end]
 
             # 初始化局部优化器状态 (仅占 1/world_size 显存)
-            if param_idx not in optim_states:
-                optim_states[param_idx] = {
+            if layer_param_idx not in optim_states:
+                optim_states[layer_param_idx] = {
                     'step': 0,
                     'exp_avg': torch.zeros_like(local_param, device=local_param.device),
                     'exp_avg_sq': torch.zeros_like(local_param, device=local_param.device)
                 }
 
-            state = optim_states[param_idx]
+            state = optim_states[layer_param_idx]
             state['step'] += 1
             t = state['step']
             exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
@@ -159,10 +164,10 @@ def manual_zero_stage2_gpu(rank: int, world_size: int, data: torch.Tensor, num_l
             # NOTE: all_gather_into_tensor 更高效，但要求所有进程的输入张量形状完全相同；而 all_gather 更灵活，可以处理形状不一致的情况，但会输出一个张量列表。
             # local_param: [local_chunk_size=num_dim/world_size, num_dim]
             # => param: [num_dim, num_dim]
-            dist.all_gather_into_tensor(output_tensor=param.data, input_tensor=local_param)
+            dist.all_gather_into_tensor(output_tensor=layer_param.data, input_tensor=local_param)
 
             # 清理 local_grad，为下一步做准备
-            param.local_grad = None
+            layer_param.local_grad = None
         # end of param_idx
 
         # 打印验证
