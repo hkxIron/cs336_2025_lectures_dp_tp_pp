@@ -74,6 +74,11 @@ class ZeRO3OffloadLinear(torch.autograd.Function):
     def backward(ctx, grad_out):
         """
         反向传播：CPU参数 -> GPU -> All-Gather -> 算梯度 -> Reduce-Scatter -> GPU梯度 -> CPU -> 释放GPU显存
+
+        矩阵乘法的梯度推导：
+        Y=X@W
+        dL/dW = X.T @ dL/dY
+        dL/dX = dL/dY @ W.T
         """
         x, = ctx.saved_tensors # 取出ctx.save_for_backward中的值
         local_param_cpu = ctx.local_param_cpu
@@ -122,7 +127,6 @@ class ZeRO3OffloadLinear(torch.autograd.Function):
         # 返回的 local_grad_cpu 是一个 CPU Tensor, 立即返回，不等待传输完成
         # NOTE: x的梯度放在GPU上， param的梯度放在CPU上
         return x_grad_gpu, local_grad_cpu, None, None, None
-
 
 def zero3_offload_main(rank: int, world_size: int, data: torch.Tensor, num_layers: int, num_steps: int):
     '''
