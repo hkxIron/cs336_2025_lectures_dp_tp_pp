@@ -406,10 +406,8 @@ def data_parallelism():
     print("- Gradients are all-reduced to be the same across ranks")
     print("- Therefore, parameters remain the same across ranks")
 
-def generate_sample_data():
+def generate_sample_data(batch_size: int=128, num_dim: int=1024):
     torch.manual_seed(42)
-    batch_size = 128
-    num_dim = 1024
     data = torch.randn(batch_size, num_dim)
     print(f"generate_sample_data: batch_size = {batch_size}, num_dim = {num_dim}")
     return data
@@ -1152,10 +1150,10 @@ def pipeline_parallelism_main_gpipe(rank: int, world_size: int, data: torch.Tens
 
 ############################################################
 
-def setup(rank: int, world_size: int):
+def setup(rank: int, world_size: int, port:str="15623"):
     # Specify where master lives (rank 0), used to coordinate (actual data goes through NCCL)
     os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "15623"
+    os.environ["MASTER_PORT"] = port
 
     if torch.cuda.is_available():
         # NCCL: nvdia collective communication library
